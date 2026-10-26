@@ -583,7 +583,7 @@ function topCompounds(res, gene, n) {
 function renderKB(kb) {
   if (!kb) return `<section class="panel"><h2>规则库机制推理</h2><p class="hint">所选中药或化疗药不在人工整理的药理规则库（约 20 种草药/制剂 × 20 种化疗药）中，本节跳过。</p></section>`;
   const lv = x => x >= .8 ? "高" : x >= .45 ? "中" : x > 0 ? "低" : "";
-  return `<section class="panel"><div class="sectionhead"><h2>规则库机制推理（PK/PD）</h2><p class="hint">${esc(kb.herbs.join("、"))} × ${esc(kb.drugs.join("、"))}；来自人工整理的药理知识库，等级代表证据可信度而非效应大小；文献引用尚未逐条核对</p></div>
+  return `<section class="panel"><div class="sectionhead"><h2>规则库机制推理（PK/PD）</h2><p class="hint">${esc(kb.herbs.join("、"))} × ${esc(kb.drugs.join("、"))}；来自人工整理的药理知识库，等级代表证据可信度而非效应大小；文献引用已于 2026-10-26 逐条核对 PubMed 并附 PMID</p></div>
     <div class="cols"><div class="tbl"><table><tr><th>可能的不良反应</th><th>等级</th><th>机制</th></tr>${kb.ae.map(r => `<tr><td><b>${esc(r.label)}</b></td>
       <td>${r.up ? `<span class="pill ${r.up >= .8 ? "sig" : "near"}">${lv(r.up)}</span>` : `<span class="pill known">可能减轻</span>`}</td>
       <td>${r.why.map(w => `<div>${w[0] === "increase" ? "↑" : "↓"} ${esc(w[1])}</div>`).join("")}</td></tr>`).join("") || `<tr><td colspan="3" class="hint">未推导出相互作用</td></tr>`}</table></div>
