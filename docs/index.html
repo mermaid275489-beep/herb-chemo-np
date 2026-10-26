@@ -1,0 +1,64 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<title>中药–化疗网络药理预测</title>
+<meta name="description" content="输入常用中药或复方、化疗药或方案、任意癌种，基于 TCMSP、STRING、Open Targets 进行网络药理学预测：靶点重叠、网络邻近度、不良反应模块与通路富集。">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500&family=IBM+Plex+Sans:wght@400;500;600;700&display=swap">
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<main>
+  <header class="top">
+    <div class="eyebrow">TCM × Chemotherapy × Cancer · network pharmacology</div>
+    <h1>中药–化疗网络药理预测</h1>
+    <p class="lede">输入中药或复方、化疗药或方案、癌种，计算中药靶点与癌种基因、化疗药作用靶点、化疗药代谢/转运基因以及 29 个不良反应模块之间的重叠与网络邻近度，并做通路富集。</p>
+  </header>
+
+  <section class="panel" id="query-panel" aria-label="输入">
+    <div class="fields">
+      <div class="field" id="f-herb">
+        <label for="herb-input">中药 / 复方 <span class="hint">可多选，组成复方；支持中文名、拼音、拉丁名</span></label>
+        <div class="picker"><div class="chips" id="herb-chips"></div>
+          <input id="herb-input" autocomplete="off" placeholder="如 黄芪、huangqi、Astragalus">
+        </div>
+        <div class="menu" id="herb-menu" role="listbox" hidden></div>
+      </div>
+      <div class="field" id="f-drug">
+        <label for="drug-input">化疗药 / 方案 <span class="hint">可多选；支持 FOLFOX、CAPOX、AC-T 等缩写</span></label>
+        <div class="picker"><div class="chips" id="drug-chips"></div>
+          <input id="drug-input" autocomplete="off" placeholder="如 奥沙利铂、irinotecan、FOLFIRI">
+        </div>
+        <div class="menu" id="drug-menu" role="listbox" hidden></div>
+      </div>
+      <div class="field" id="f-cancer">
+        <label for="cancer-input">癌种 <span class="hint">常见癌种可用中文；其他疾病请用英文名，实时检索 Open Targets</span></label>
+        <div class="picker"><div class="chips" id="cancer-chips"></div>
+          <input id="cancer-input" autocomplete="off" placeholder="如 胃癌、colorectal cancer">
+        </div>
+        <div class="menu" id="cancer-menu" role="listbox" hidden></div>
+      </div>
+    </div>
+    <div class="options">
+      <label class="check"><input type="checkbox" id="opt-obdl" checked> 成分筛选 OB ≥ 30% 且 DL ≥ 0.18（口服；外用请取消）</label>
+      <label class="check"><input type="checkbox" id="opt-validated"> 只用 TCMSP 实验验证靶点</label>
+      <label class="check"><input type="checkbox" id="opt-fast"> 快速模式（随机化 200 次）</label>
+      <button id="run" type="button">开始分析</button>
+    </div>
+    <div class="examples" id="examples"><span class="hint">示例：</span></div>
+    <p class="status" id="status" role="status"></p>
+  </section>
+
+  <div id="results"></div>
+
+  <section class="panel prose" id="about">
+    <h2>方法与数据</h2>
+    <div id="about-body"></div>
+  </section>
+</main>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/vis-network/9.1.9/standalone/umd/vis-network.min.js"></script>
+<script src="app.js"></script>
+</body>
+</html>
