@@ -252,17 +252,20 @@ function enrich(genesIdx) {
   for (const g of genesIdx) inSet[g] = 1;
   const out = {};
   for (const [lib, terms] of Object.entries(S.pathways.libraries)) {
-    const rows = [];
-    for (const [name, members] of terms) {
+    /* BH must span every pre-defined term in the library. Correcting only over the terms that
+       happen to reach >= 3 overlapping genes shrinks the testing family after seeing the result
+       and makes q far too small (site audit 2026-10-26, issue 1). Terms with no overlap have
+       p = 1 by definition and cost nothing, but they belong in the denominator. */
+    const rows = terms.map(([name, members]) => {
       let k = 0;
       for (const m of members) if (inSet[m]) k++;
-      if (k < 3) continue;
-      rows.push({ name, k, K: members.length, p: hyperSF(k, N, members.length, genesIdx.length), members });
-    }
+      return { name, k, K: members.length, p: hyperSF(k, N, members.length, genesIdx.length), members };
+    });
     const q = bh(rows.map(r => r.p));
     rows.forEach((r, i) => r.q = q[i]);
-    rows.sort((a, b) => a.q - b.q || b.k - a.k || a.p - b.p);
-    out[lib] = { n: rows.length, top: rows.slice(0, 12).map(r => ({ ...r, genes: r.members.filter(m => inSet[m]).map(m => S.G.genes[m]) })) };
+    const shown = rows.filter(r => r.k >= 3).sort((a, b) => a.q - b.q || b.k - a.k || a.p - b.p);
+    out[lib] = { nTests: rows.length, n: shown.length, nSig: shown.filter(r => r.q < 0.05).length,
+      top: shown.slice(0, 12).map(r => ({ ...r, genes: r.members.filter(m => inSet[m]).map(m => S.G.genes[m]) })) };
   }
   return out;
 }
@@ -280,7 +283,10 @@ function kbPredict() {
   const P = S.data.kb.pharm, cnMap = S.data.kb.herb_cn;
   const herbs = [...new Set(S.herbs.map(i => cnMap[S.data.herbs.herbs[i].cn]).filter(k => k && P.herbs[k]))];
   const drugs = Object.fromEntries(S.drugs.map(d => d.kb || d.en).filter(k => P.drugs[k]).map(k => [k, P.drugs[k]]));
-  if (!herbs.length || !Object.keys(drugs).length) return null;
+  /* what the rule analysis does NOT cover, so the page can say so instead of implying "no risk" */
+  const uncoveredHerbs = S.herbs.map(i => S.data.herbs.herbs[i].cn).filter(cn => !cnMap[cn]);
+  const uncoveredDrugs = S.drugs.filter(d => !P.drugs[d.kb || d.en]).map(d => d.cn || d.en);
+  if (!herbs.length || !Object.keys(drugs).length) return { empty: true, uncoveredHerbs, uncoveredDrugs };
   const cancerName = S.cancer ? (S.cancer.cn || "") : "";
   const ck = (KB_CANCER.find(([re]) => re.test(cancerName)) || [])[1];
   const cancer = (ck && P.cancers[ck]) || {};
@@ -297,13 +303,21 @@ function kbPredict() {
       const p = paths[m.target]; if (!p) continue;
       const [kind, sign] = effect(p.role, m.effect);
       let score = KB_EV[m.evidence] * KB_IMP[p.importance] * (src !== h ? .7 : 1);
+      const caveats = [];
+      /* a human study that failed to reproduce the in vitro finding should constrain it,
+         not sit in a footnote while the prediction stands (audit issue 5) */
+      if (m.human_null) { score *= .15; caveats.push("体外阳性但人体研究未检出相应变化"); }
+      /* being a substrate does not make inhibition and induction equally consequential (issue 6) */
+      const sens = m.effect === "inhibits" ? p.inhibition_sensitivity : p.induction_sensitivity;
+      if (sens != null) { score *= sens; caveats.push(p.sensitivity_note || "该药对此方向的临床敏感性较低"); }
+      if (m.evidence === "clinical" && m.study === "probe") caveats.push("上游为健康志愿者探针药研究，推广到本组合属机制外推");
       let cons;
       if (kind === "exposure") { score *= cancer.pk_amplify || 1; if (p.role === "efflux" && d.route === "iv") score *= .6;
         cons = sign > 0 ? `暴露↑ → ${d.exposure_ae.map(label).join("、")}风险↑` : "暴露↓ → 疗效可能下降"; }
       else if (kind === "organ") cons = `${label(p.ae)}${sign > 0 ? "↑" : "↓"}`;
       else if (kind === "efficacy") cons = sign < 0 ? "肿瘤细胞内药物↓ → 疗效可能下降" : "肿瘤细胞内药物↑";
       else cons = "方向不确定";
-      pk.push({ herb: h, src, m, p, kind, sign, drug: dk, cons, score: Math.round(score * 1000) / 1000 });
+      pk.push({ herb: h, src, m, p, kind, sign, drug: dk, cons, caveats, score: Math.round(score * 1000) / 1000 });
     }
   }
   const flags = new Set(cancer.flags || []), pdHits = new Map();
@@ -333,12 +347,22 @@ function kbPredict() {
     if (dir === "increase") { score *= (cancer.ae_boost || {})[ae] || 1; r.up = Math.max(r.up, score) + (r.up ? .1 : 0); } else r.down = Math.max(r.down, score);
     r.why.push([dir, text]);
   };
-  const pairs = new Map();
+  const pairs = new Map(), conflicts = [];
   for (const s of pk) { const k = s.herb + "|" + s.drug; if (!pairs.has(k)) pairs.set(k, []); pairs.get(k).push(s); }
   for (const steps of pairs.values()) {
     const { herb, drug } = steps[0], d = drugs[drug], exp = steps.filter(s => s.kind === "exposure");
     if (exp.length) {
       const top = Math.max(...exp.map(s => KB_EV[s.m.evidence])), lead = exp.filter(s => KB_EV[s.m.evidence] === top);
+      /* Opposite directions at the same evidence level are usually different conditions (single
+         vs repeated dosing, gut vs liver), not forces that cancel out. Summing them to ~0 hid the
+         danshen case entirely (audit issue 4): report the branches instead of a net of zero. */
+      const leadSigns = new Set(lead.map(s => s.sign).filter(Boolean));
+      if (leadSigns.size > 1) {
+        conflicts.push({ herb, drug, targets: [...new Set(exp.map(s => s.m.target))],
+          branches: lead.map(s => ({ effect: s.m.effect, target: s.m.target, cons: s.cons,
+            note: s.m.note || "", ref: s.m.ref || "", score: s.score })) });
+        continue;   // no net-exposure AE: the direction is condition-dependent, not absent
+      }
       const v = lead.reduce((a, s) => a + s.sign * s.score, 0) + .3 * exp.filter(s => !lead.includes(s)).reduce((a, s) => a + s.sign * s.score, 0);
       const dir = v > .05 ? "↑" : v < -.05 ? "↓" : "≈";
       const text = `${herb} 经 ${[...new Set(exp.map(s => s.m.target))].join("/")} 使 ${drug} 暴露${dir}（以${KB_EVL[lead[0].m.evidence]}证据为主）`;
@@ -350,8 +374,16 @@ function kbPredict() {
   for (const h of pdHits.values()) add(h.r.result, h.r.direction, h.score, `${h.src}（${h.e.effect}）× ${h.drug || "癌种背景"}：${h.r.explain}`);
   const observed = P.observed_pairs.filter(o => herbs.includes(o.herb) && o.drug in drugs);
   for (const o of observed) if (o.ae) add(o.ae, o.direction, KB_OBS[o.level] ?? .5, `${o.finding}（${o.level}，${o.ref}）`);
+  /* a direct human study of this very pair that found nothing caps what mechanism alone may claim */
+  for (const o of observed.filter(x => x.null_finding)) for (const ae of o.caps || []) {
+    const r = risks.get(ae);
+    if (!r || !r.up) continue;
+    if (r.up > 0.35) r.capped = { from: r.up, by: `${o.herb} + ${o.drug}`, note: o.caps_note || "", ref: o.ref };
+    r.up = Math.min(r.up, 0.35);
+    r.why.push(["increase", `该组合已有直接人体研究未检出显著变化，机制外推的确定性相应下调（${o.ref}）`]);
+  }
   const ae = [...risks.values()].map(r => ({ ...r, up: Math.min(r.up, 1.5) })).sort((a, b) => b.up - a.up || b.down - a.down);
-  return { herbs, drugs: Object.keys(drugs), ae, pk, observed };
+  return { herbs, drugs: Object.keys(drugs), ae, pk, observed, conflicts, uncoveredHerbs, uncoveredDrugs };
 }
 
 /* ------------------------------------------------------------------ live Open Targets */
@@ -558,7 +590,7 @@ function render(res) {
   out.push(`<section class="panel"><div class="sectionhead"><h2>机制网络</h2><p class="hint">展示与癌种、化疗靶点、PK 基因或特异（百分位 ≤ 25%）不良反应模块重叠的靶点；可拖动缩放</p></div>
     <div class="legend"><span><i class="dot" style="background:var(--herb)"></i>中药</span><span><i class="dot" style="background:#9bc8a8"></i>成分</span><span><i class="dot" style="background:var(--target)"></i>靶点</span><span><i class="dot" style="background:var(--drug)"></i>化疗药</span><span><i class="dot" style="background:#6b7b8c"></i>癌种</span><span><i class="dot" style="background:var(--module)"></i>不良反应模块</span></div>
     <div id="graph"></div></section>`);
-  out.push(`<section class="panel" id="enrich-panel"><div class="sectionhead"><h2>通路富集</h2><p class="hint">Reactome 与 GO 生物过程；超几何检验，BH 校正，背景为 STRING 网络基因</p></div><div id="enrich-body"><p class="hint">正在载入通路库…</p></div></section>`);
+  out.push(`<section class="panel" id="enrich-panel"><div class="sectionhead"><h2>通路富集</h2><p class="hint">Reactome 与 GO 生物过程；超几何检验，BH 校正覆盖通路库中全部条目</p></div><div id="enrich-body"><p class="hint">正在载入通路库…</p></div></section>`);
   out.push(renderKB(res.kb));
   out.push(`<section class="panel"><h2>下载</h2><div class="downloads">
     <button class="btn ghost" data-dl="network">网络检验结果 CSV</button><button class="btn ghost" data-dl="targets">中药靶点–成分 CSV</button>
@@ -574,6 +606,12 @@ function render(res) {
   renderEnrichment(res);
 }
 
+/* make every PMID in a ref string clickable */
+function refLinks(ref) {
+  return esc(ref).replace(/PMID\s*(\d+)/g, (_, id) =>
+    `<a href="https://pubmed.ncbi.nlm.nih.gov/${id}/" target="_blank" rel="noopener">PMID ${id}</a>`);
+}
+
 function topCompounds(res, gene, n) {
   const m = res.herb.geneComp.get(gene);
   if (!m) return "";
@@ -581,16 +619,29 @@ function topCompounds(res, gene, n) {
 }
 
 function renderKB(kb) {
-  if (!kb) return `<section class="panel"><h2>规则库机制推理</h2><p class="hint">所选中药或化疗药不在人工整理的药理规则库（约 20 种草药/制剂 × 20 种化疗药）中，本节跳过。</p></section>`;
-  const lv = x => x >= .8 ? "高" : x >= .45 ? "中" : x > 0 ? "低" : "";
-  return `<section class="panel"><div class="sectionhead"><h2>规则库机制推理（PK/PD）</h2><p class="hint">${esc(kb.herbs.join("、"))} × ${esc(kb.drugs.join("、"))}；来自人工整理的药理知识库，等级代表证据可信度而非效应大小；文献引用已于 2026-10-26 逐条核对 PubMed 并附 PMID</p></div>
-    <div class="cols"><div class="tbl"><table><tr><th>可能的不良反应</th><th>等级</th><th>机制</th></tr>${kb.ae.map(r => `<tr><td><b>${esc(r.label)}</b></td>
+  const gap = k => !k || (!k.uncoveredHerbs?.length && !k.uncoveredDrugs?.length) ? "" :
+    `<p class="note">规则库未覆盖：${esc([...(k.uncoveredHerbs || []), ...(k.uncoveredDrugs || [])].join("、"))}。
+      未覆盖不等于无风险，只是本规则库没有收录相应条目。</p>`;
+  if (!kb || kb.empty) return `<section class="panel"><h2>规则库机制推理</h2>${gap(kb)}
+    <p class="hint">人工整理的药理规则库目前覆盖 ${Object.keys(S.data.kb.pharm.herbs).length} 个草药/制剂档案与 ${Object.keys(S.data.kb.pharm.drugs).length} 个药物档案，其中 ${S.data.kb.covered.length} 味可从本页中药列表直接选到（${esc(S.data.kb.covered.join("、"))}）。注射剂与标准化复方（康莱特、参芪扶正、华蟾素、PHY906）的证据属于成品制剂，不会由同名饮片继承。</p></section>`;
+  const lv = x => x >= .8 ? "较高" : x >= .45 ? "中" : x > 0 ? "低" : "";
+  const conflictPanel = !kb.conflicts?.length ? "" : `<div class="note" style="margin-bottom:10px"><b>方向取决于给药条件，未给出净效应：</b>${kb.conflicts.map(c =>
+    `<div style="margin-top:6px">${esc(c.herb)} × ${esc(c.drug)}（经 ${esc(c.targets.join("/"))}）：${c.branches.map(b =>
+      `<div style="margin-left:1em">· ${b.effect === "inhibits" ? "抑制" : "诱导"} ${esc(b.target)} → ${esc(b.cons)}${b.note ? `<span class="hint">（${esc(b.note)}）</span>` : ""}</div>`).join("")}
+      </div>`).join("")}<div class="hint" style="margin-top:6px">同一草药的相反方向多来自不同条件（单次与连续给药、肠道与肝脏作用部位），不能相互抵消为“无影响”。本页因此不对该组合输出净暴露方向，请按实际用法分支判断。</div></div>`;
+  return `<section class="panel"><div class="sectionhead"><h2>规则库机制推理（PK/PD）</h2><p class="hint">${esc(kb.herbs.join("、"))} × ${esc(kb.drugs.join("、"))}；等级是本工具内部的证据排序，<b>未经结局验证</b>，不是临床风险分级</p></div>
+    ${gap(kb)}${conflictPanel}
+    <div class="cols"><div class="tbl"><table><tr><th>可能的不良反应</th><th>内部排序</th><th>机制</th></tr>${kb.ae.map(r => `<tr><td><b>${esc(r.label)}</b>${r.capped ? `<div class="hint">已按直接人体研究下调（原 ${r.capped.from.toFixed(2)}）</div>` : ""}</td>
       <td>${r.up ? `<span class="pill ${r.up >= .8 ? "sig" : "near"}">${lv(r.up)}</span>` : `<span class="pill known">可能减轻</span>`}</td>
       <td>${r.why.map(w => `<div>${w[0] === "increase" ? "↑" : "↓"} ${esc(w[1])}</div>`).join("")}</td></tr>`).join("") || `<tr><td colspan="3" class="hint">未推导出相互作用</td></tr>`}</table></div>
     <div class="tbl"><table><tr><th>中药/成分</th><th>靶点</th><th>证据</th><th>化疗药通路</th><th>推导</th></tr>${kb.pk.sort((a, b) => b.score - a.score).map(s => `<tr><td>${esc(s.src)}<div class="hint">${esc(s.m.constituent || "")}</div></td>
-      <td class="gene">${s.m.effect === "inhibits" ? "抑制" : "诱导"} ${esc(s.m.target)}</td><td>${KB_EVL[s.m.evidence]}${s.m.ref ? `<div class="hint">${esc(s.m.ref)}</div>` : ""}</td>
-      <td>${esc(s.drug)}：${KB_ROLE[s.p.role]}</td><td>${esc(s.cons)}</td></tr>`).join("") || `<tr><td colspan="5" class="hint">无 PK 通路交集</td></tr>`}</table></div></div>
-    ${kb.observed.length ? `<p style="margin-top:8px"><b>已知人体研究：</b>${kb.observed.map(o => `${esc(o.herb)} + ${esc(o.drug)}（${esc(o.level)}）${esc(o.finding)} — ${esc(o.ref)}`).join("；")}</p>` : ""}</section>`;
+      <td class="gene">${s.m.effect === "inhibits" ? "抑制" : "诱导"} ${esc(s.m.target)}</td>
+      <td>${KB_EVL[s.m.evidence]}${s.m.evidence === "clinical" && s.m.study === "probe" ? "<span class='hint'>（探针药）</span>" : ""}${s.m.ref ? `<div class="hint">${refLinks(s.m.ref)}</div>` : ""}</td>
+      <td>${esc(s.drug)}：${KB_ROLE[s.p.role]}</td>
+      <td>${esc(s.cons)}${(s.caveats || []).map(c => `<div class="hint">⚠ ${esc(c)}</div>`).join("")}</td></tr>`).join("") || `<tr><td colspan="5" class="hint">无 PK 通路交集</td></tr>`}</table></div></div>
+    ${kb.observed.length ? `<p style="margin-top:8px"><b>该组合的直接人体研究：</b></p><ul>${kb.observed.map(o =>
+      `<li${o.null_finding ? ' class="ok"' : ""}>${esc(o.herb)} + ${esc(o.drug)}（${esc(o.level)}${o.null_finding ? "，未检出显著变化" : ""}）：${esc(o.finding)} — <span class="hint">${refLinks(o.ref)}</span></li>`).join("")}</ul>`
+      : `<p class="hint" style="margin-top:8px">该组合没有直接人体研究；以上均为由上游机制研究外推。</p>`}</section>`;
 }
 
 function drawGraph(res) {
@@ -648,8 +699,8 @@ async function renderEnrichment(res) {
   if (pdCtx) sets.push(["化疗药靶点邻域", nearGenes(res.A, pdCtx.genes)]);
   res.enrich = sets.map(([label, idx]) => ({ label, n: idx.length, r: enrich(idx) }));
   body.innerHTML = `<div class="cols">${res.enrich.map(e => `<div><h3>${esc(e.label)}<span class="hint">（输入 ${e.n} 个基因）</span></h3>${!e.r ? `<p class="hint">基因少于 3 个，跳过。</p>` :
-    Object.entries(e.r).map(([lib, v]) => `<div class="tbl"><table><tr><th>${lib === "GO_BP" ? "GO 生物过程" : "Reactome"}</th><th>重叠</th><th>q</th></tr>${v.top.slice(0, 8).map(t => `<tr title="${esc(t.genes.join(", "))}"><td>${esc(t.name)}</td><td class="num">${t.k}/${t.K}</td><td class="num">${fmtP(t.q)}</td></tr>`).join("") || `<tr><td colspan="3" class="hint">无可检验条目</td></tr>`}</table></div>`).join("")}</div>`).join("")}</div>
-    <p class="hint">“邻域”指位于该模块内或与模块基因在 STRING 中直接相连的中药靶点，与 final27 分析一致。鼠标悬停可看重叠基因。</p>`;
+    Object.entries(e.r).map(([lib, v]) => `<div class="tbl"><table><tr><th>${lib === "GO_BP" ? "GO 生物过程" : "Reactome"}<div class="hint">BH 覆盖 ${v.nTests} 条，q&lt;0.05 共 ${v.nSig} 条</div></th><th>重叠</th><th>q</th></tr>${v.top.slice(0, 8).map(t => `<tr title="${esc(t.genes.join(", "))}"><td>${esc(t.name)}</td><td class="num">${t.k}/${t.K}</td><td class="num${t.q < 0.05 ? " lv lv-高" : ""}">${fmtP(t.q)}</td></tr>`).join("") || `<tr><td colspan="3" class="hint">无可检验条目</td></tr>`}</table></div>`).join("")}</div>`).join("")}</div>
+    <p class="hint">“邻域”指位于该模块内或与模块基因在 STRING 中直接相连的中药靶点，与 final27 分析一致。鼠标悬停可看重叠基因。表中按 q 排序并只显示重叠 ≥ 3 的条目，但 BH 校正的检验家族是整个通路库；输入基因很少时，多数条目校正后不再显著属正常结果。</p>`;
 }
 
 /* ------------------------------------------------------------------ downloads & links */
@@ -666,8 +717,8 @@ function download(kind) {
     for (const [g, m] of res.herb.geneComp) rows.push([g, S.G.idx.has(g), [...m.keys()].map(ci => S.data.herbs.compounds[ci][1]).join(";"), [...new Set(m.values())].join(";")]);
     name = "herb_targets.csv";
   } else {
-    rows = [["gene_set", "library", "term", "overlap", "term_size", "p", "q", "genes"]];
-    for (const e of res.enrich || []) for (const [lib, v] of Object.entries(e.r || {})) for (const t of v.top) rows.push([e.label, lib, t.name, t.k, t.K, t.p, t.q, t.genes.join(";")]);
+    rows = [["gene_set", "library", "bh_family_size", "term", "overlap", "term_size", "p", "q", "genes"]];
+    for (const e of res.enrich || []) for (const [lib, v] of Object.entries(e.r || {})) for (const t of v.top) rows.push([e.label, lib, v.nTests, t.name, t.k, t.K, t.p, t.q, t.genes.join(";")]);
     name = "enrichment_top.csv";
   }
   const a = document.createElement("a");
@@ -739,9 +790,11 @@ function renderAbout() {
     <li>化疗药：${S.data.drugs.drugs.length} 种常用抗肿瘤药。药效靶点优先采用 final27 分析中整理的核心基因，其次为 Open Targets 作用机制靶点；铂类、多数烷化剂等直接作用于 DNA 的药物没有蛋白靶点，按同类药物代理或标注为不可用。代谢/转运基因来自 final27 表和人工规则库。不良事件来自 Open Targets 收录的 FAERS 显著信号。</li>
     <li>不良反应模块：final27 分析的 29 个模块，核心基因为人工整理的机制基因（标注促损伤/保护性），扩展基因来自 HPO 表型–基因关联。</li>
     <li>通路：MSigDB v2026.1 中的 Reactome 与 GO 生物过程（KEGG 因许可限制未纳入）。</li></ul>
-  <p><b>方法</b>（与 final27 分析一致）：中药靶点与各模块的重叠用超几何检验；网络邻近度用 Guney 等的 closest 距离（每个中药靶点到最近模块基因的最短路径均值），以度匹配随机抽样（度窗口逐步放宽直到候选 ≥ 20 个节点）重复 1,000 次得到 Z 值和经验 P 值；一次查询内的全部检验分别对重叠 P 和邻近度 P 做 BH 校正；重叠 > 0 且 q < 0.05，或 Z < −2 且 q < 0.05 视为显著。富集只使用位于模块内或与模块基因直接相连的中药靶点。随机数种子固定，同一输入结果可复现，但与论文中 Python 实现的随机序列不同，Z 值会有小幅差异。</p>
+  <p><b>方法</b>（与 final27 分析一致）：中药靶点与各模块的重叠用超几何检验；网络邻近度采用 closest 距离（每个中药靶点到最近模块基因的最短路径均值），以度匹配随机抽样重复 1,000 次得到 Z 值和经验 P 值；一次查询内的全部检验分别对重叠 P 和邻近度 P 做 BH 校正；重叠 > 0 且 q < 0.05，或 Z < −2 且 q < 0.05 视为显著。富集只使用位于模块内或与模块基因直接相连的中药靶点，BH 校正覆盖通路库中<b>全部</b>条目（Reactome 1,833 条、GO BP 7,468 条），而非只对重叠 ≥ 3 的条目校正。随机数种子固定，同一输入结果可复现，但与论文中 Python 实现的随机序列不同，Z 值会有小幅差异。</p>
+  <p class="note"><b>与 Guney 等原始方法的差异（请勿等同引用）：</b>本页只对中药靶点一侧做度匹配随机化，模块一侧固定；原文对两侧都随机化，且度分箱要求每箱至少 100 个节点，本页为 ≥ 20 个且允许重复抽样。网络并非全连通（最大连通分量 11,693/12,323 个节点），计算均值时跳过不可达节点，会改变有效分母。这些设定沿用 final27 实现，属于另行定义的条件零模型。</p>
   <p><b>特异性（本网页新增，不在 final27 中）：</b>TCMSP 靶点普遍偏向网络枢纽基因，度匹配随机化无法完全消除这种偏倚，因此大多数中药与多数模块都会“显著接近”。为此，每个模块再计算“中药间百分位”：在同样筛选条件下、网络中靶点 ≥ 5 个的全部单味中药里，与该模块的 closest 距离不大于本输入的比例（不含输入本身）。百分位 ≤ 10% 记为高特异，≤ 25% 记为较特异。多味复方是与单味药比较，仅作参考。</p>
-  <p class="note"><b>使用须知：</b>本工具用于科研假设生成。网络关联不等于临床作用，不能区分抑制或诱导、加重或减轻；TCMSP 预测靶点存在假阳性。结果不能作为用药依据，临床决策请咨询医生和临床药师。</p>
+  <p class="note"><b>使用须知：</b>本工具用于科研假设生成，定位是“中药–抗肿瘤药相互作用证据与网络探索”，<b>不是经过验证的临床风险判断工具</b>。网络关联不等于临床作用，不能区分抑制或诱导、加重或减轻；TCMSP 预测靶点存在假阳性。规则库给出的“较高/中/低”是本工具内部排序，<b>尚无独立阳性/阴性组合验证集与结局校准</b>。癌种只用于设置少量背景系数，不能替代患者的肝肾功能、受体状态、基因型与实际并用药。结果不能作为用药依据，临床决策请咨询医生和临床药师。</p>
+  <p class="hint">已知局限（据 2026-10-26 外部审核）：规则库 40 条酶/转运记录中 20 条、32 条药效记录中 27 条没有独立引用，属通用药理整理，未逐条溯源；方案缩写按主要细胞毒药物计算（CHOP 未含泼尼松，S-1 以替加氟代表）；普通制剂与脂质体/白蛋白结合型目前视为同一药物；FAERS“已知”为统计信号，不等于说明书确认的因果关系。</p>
   <p class="hint">主要参考：Ru J 等，J Cheminform 2014（TCMSP）；Szklarczyk D 等，Nucleic Acids Res 2023（STRING v12）；Ochoa D 等，Nucleic Acids Res 2023（Open Targets）；Guney E 等，Nat Commun 2016（网络邻近度）；Liberzon A 等，Cell Syst 2015（MSigDB）；Köhler S 等，Nucleic Acids Res 2021（HPO）。</p>`;
 }
 

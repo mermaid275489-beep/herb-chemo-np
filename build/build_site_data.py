@@ -194,22 +194,40 @@ def cancers() -> dict:
     return {"source": "Open Targets Platform associatedTargets, top 300 by overall score", "cancers": out}
 
 
-def kb() -> dict:
-    """Rule KB plus the herb Chinese-name index so TCMSP herbs can be matched to KB entries."""
+def kb(tcmsp_names: set[str]) -> dict:
+    """Rule KB plus the TCMSP-name -> KB-key map used by the mechanism panel.
+
+    Only `product: "herb"` profiles may be reached from a TCMSP decoction piece. Injections and
+    standardised formulas (Kanglaite, Shenqi Fuzheng, Huachansu, PHY906) carry evidence that
+    belongs to a finished product, so a same-named crude herb must not inherit it; they stay in
+    `pharm` for reference but are left out of the map. Unmapped names are reported so the page can
+    state which inputs the rule analysis did not cover.
+    """
     pharm = json.loads(KB.read_text(encoding="utf-8"))
     lex = json.loads(LEXICON.read_text(encoding="utf-8"))
-    herb_cn = {}
+    herb_cn, blocked = {}, {}
     for key, h in lex["herbs"].items():
+        prof = pharm["herbs"].get(key)
+        if not prof:
+            continue
         for s in h["synonyms"]:
-            if re.search(r"[一-鿿]", s):
+            if not re.search(r"[一-鿿]", s):
+                continue
+            if prof["product"] == "herb":
                 herb_cn[s] = key
-    return {"pharm": pharm, "herb_cn": herb_cn}
+            else:
+                blocked[s] = {"key": key, "product": prof["product"]}
+    covered = sorted(n for n in herb_cn if n in tcmsp_names)
+    print(f"[kb] {len(pharm['herbs'])} profiles; {len(covered)} TCMSP herbs reach the rule KB: {'、'.join(covered)}")
+    print(f"[kb] product-blocked names (not inherited by crude herbs): {sorted(blocked)}")
+    return {"pharm": pharm, "herb_cn": herb_cn, "blocked": blocked, "covered": covered}
 
 
 if __name__ == "__main__":
     sys.stdout.reconfigure(encoding="utf-8")
     target_map = json.loads((RAW / "target_map.json").read_text(encoding="utf-8"))
-    write_json("herbs.json", herbs(target_map))
+    H = herbs(target_map)
+    write_json("herbs.json", H)
     write_json("drugs.json", drugs())
     write_json("cancers.json", cancers())
-    write_json("kb.json", kb())
+    write_json("kb.json", kb({h["cn"] for h in H["herbs"]}))
